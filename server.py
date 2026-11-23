@@ -1,4 +1,4 @@
-"""Small, dependency-free API server for the LabLink evaluation demo.
+"""Small API server for LabLink, using local SQLite or hosted PostgreSQL.
 
 Run with: python server.py
 
@@ -19,18 +19,65 @@ from contextlib import closing
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # PostgreSQL support is installed only for Vercel deployments.
+    psycopg = None
+    dict_row = None
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "lablink.sqlite3"
 DB_PATH = Path(os.environ.get("LABLINK_DB_PATH", str(DEFAULT_DB))).expanduser()
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_BODY_BYTES = 64 * 1024
 STATIC_FILES = {"index.html", "styles.css", "app.js"}
 VALID_DURATIONS = {60, 90, 120, 180}
 VALID_STATUSES = {"approved", "declined", "needs-info"}
+
+DATABASE_ERRORS = (sqlite3.Error,) + ((psycopg.Error,) if psycopg else ())
+
+
+class DatabaseConnection:
+    """Tiny adapter that keeps the local SQLite and hosted Postgres SQL alike."""
+
+    def __init__(self, raw: Any, postgres: bool) -> None:
+        self.raw = raw
+        self.postgres = postgres
+
+    def execute(self, statement: str, parameters: Any = ()) -> Any:
+        if self.postgres:
+            statement = statement.replace("?", "%s")
+        return self.raw.execute(statement, parameters)
+
+    def executescript(self, script: str) -> None:
+        if not self.postgres:
+            self.raw.executescript(script)
+            return
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def begin_write(self) -> None:
+        self.execute("BEGIN" if self.postgres else "BEGIN IMMEDIATE")
+
+    def commit(self) -> None:
+        self.execute("COMMIT") if self.postgres else self.raw.commit()
+
+    def rollback(self) -> None:
+        if self.postgres:
+            self.execute("ROLLBACK")
+        else:
+            self.raw.rollback()
+
+    def close(self) -> None:
+        self.raw.close()
 
 
 RESOURCE_SEEDS = [
@@ -108,13 +155,20 @@ RESOURCE_SEEDS = [
 ]
 
 
-def connect_db() -> sqlite3.Connection:
+def connect_db() -> DatabaseConnection:
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("PostgreSQL support is missing. Install requirements.txt before starting LabLink.")
+        raw = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row, connect_timeout=5)
+        return DatabaseConnection(raw, postgres=True)
+    if os.environ.get("VERCEL_ENV") == "production":
+        raise RuntimeError("Set DATABASE_URL to a persistent PostgreSQL connection for the Vercel production deployment.")
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
+    raw = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA foreign_keys = ON")
+    raw.execute("PRAGMA busy_timeout = 10000")
+    return DatabaseConnection(raw, postgres=False)
 
 
 def utc_now() -> str:
@@ -123,7 +177,8 @@ def utc_now() -> str:
 
 def init_db() -> None:
     with closing(connect_db()) as conn:
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not conn.postgres:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS resources (
@@ -162,12 +217,14 @@ def init_db() -> None:
               ON project_requests(student, created_at DESC);
             """
         )
-        if conn.execute("SELECT COUNT(*) FROM resources").fetchone()[0] == 0:
+        resource_count = conn.execute("SELECT COUNT(*) AS count FROM resources").fetchone()["count"]
+        if resource_count == 0:
             for resource in RESOURCE_SEEDS:
                 conn.execute(
                     """INSERT INTO resources
                        (id,name,model,category,lab,location,access,next_opening,art,render_style,utilization,fairness,slots_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO NOTHING""",
                     (
                         resource["id"], resource["name"], resource["model"], resource["category"],
                         resource["lab"], resource["location"], resource["access"], resource["next"],
@@ -175,7 +232,8 @@ def init_db() -> None:
                         json.dumps(resource["slots"], ensure_ascii=False),
                     ),
                 )
-        if conn.execute("SELECT COUNT(*) FROM project_requests").fetchone()[0] == 0:
+        request_count = conn.execute("SELECT COUNT(*) AS count FROM project_requests").fetchone()["count"]
+        if request_count == 0:
             today = date.today()
             seeds = [
                 ("req-201", "Sam Rivera", "SR", "Thermal response in recycled composites", "thermal", "Tomorrow", "9:30 – 11:00", 90, "approved", "Capture temperature changes during a material stress test."),
@@ -191,7 +249,8 @@ def init_db() -> None:
                 conn.execute(
                     """INSERT INTO project_requests
                        (id,student,initials,project,resource_id,deadline,slot_day,slot_label,duration,status,purpose,created_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO NOTHING""",
                     (req_id, student, initials, project, resource_id, deadline, slot_day, slot_label, duration, status, purpose, utc_now(), utc_now()),
                 )
 
@@ -203,7 +262,7 @@ def display_deadline(iso_date: str) -> str:
         return iso_date
 
 
-def serialize_request(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def serialize_request(conn: DatabaseConnection, row: Any) -> dict:
     resource = conn.execute("SELECT name, lab FROM resources WHERE id=?", (row["resource_id"],)).fetchone()
     due = date.fromisoformat(row["deadline"])
     days_left = (due - date.today()).days
@@ -221,7 +280,7 @@ def serialize_request(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
-def get_requests(conn: sqlite3.Connection, role: str) -> list[dict]:
+def get_requests(conn: DatabaseConnection, role: str) -> list[dict]:
     if role == "faculty":
         rows = conn.execute("SELECT * FROM project_requests ORDER BY created_at DESC").fetchall()
     else:
@@ -229,7 +288,7 @@ def get_requests(conn: sqlite3.Connection, role: str) -> list[dict]:
     return [serialize_request(conn, row) for row in rows]
 
 
-def request_holds_slot(conn: sqlite3.Connection, resource_id: str, day_name: str, label: str, exclude_id: str | None = None) -> sqlite3.Row | None:
+def request_holds_slot(conn: DatabaseConnection, resource_id: str, day_name: str, label: str, exclude_id: str | None = None) -> Any | None:
     query = """SELECT id, student, status FROM project_requests
                WHERE resource_id=? AND slot_day=? AND slot_label=? AND status IN ('pending','approved')"""
     args: list[str] = [resource_id, day_name, label]
@@ -239,7 +298,7 @@ def request_holds_slot(conn: sqlite3.Connection, resource_id: str, day_name: str
     return conn.execute(query + " ORDER BY created_at LIMIT 1", args).fetchone()
 
 
-def available_slots(conn: sqlite3.Connection, resource_row: sqlite3.Row, exclude_id: str | None = None) -> list[dict]:
+def available_slots(conn: DatabaseConnection, resource_row: Any, exclude_id: str | None = None) -> list[dict]:
     slots = json.loads(resource_row["slots_json"])
     for index, slot in enumerate(slots):
         slot["index"] = index
@@ -252,7 +311,7 @@ def available_slots(conn: sqlite3.Connection, resource_row: sqlite3.Row, exclude
     return slots
 
 
-def serialize_resource(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def serialize_resource(conn: DatabaseConnection, row: Any) -> dict:
     slots = available_slots(conn, row)
     return {
         "id": row["id"], "name": row["name"], "model": row["model"],
@@ -264,7 +323,7 @@ def serialize_resource(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
-def recommend_slot(conn: sqlite3.Connection, resource_row: sqlite3.Row, deadline_text: str) -> dict | None:
+def recommend_slot(conn: DatabaseConnection, resource_row: Any, deadline_text: str) -> dict | None:
     try:
         deadline = date.fromisoformat(deadline_text)
     except (TypeError, ValueError):
@@ -330,7 +389,7 @@ class LabLinkHandler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         role = self.demo_role()
         if path == "/api/health":
-            self.send_json({"status": "ok", "mode": "demo", "database": "sqlite", "loginRequired": False})
+            self.send_json({"status": "ok", "mode": "demo", "database": "postgresql" if DATABASE_URL else "sqlite", "loginRequired": False})
             return
         if path in {"/api/bootstrap", "/api/resources", "/api/requests"}:
             with closing(connect_db()) as conn:
@@ -392,8 +451,9 @@ class LabLinkHandler(BaseHTTPRequestHandler):
 
         with closing(connect_db()) as conn:
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                resource = conn.execute("SELECT * FROM resources WHERE id=?", (resource_id,)).fetchone()
+                conn.begin_write()
+                resource_query = "SELECT * FROM resources WHERE id=?" + (" FOR UPDATE" if conn.postgres else "")
+                resource = conn.execute(resource_query, (resource_id,)).fetchone()
                 if not resource:
                     conn.rollback()
                     self.fail("Resource not found.", 404)
@@ -421,7 +481,7 @@ class LabLinkHandler(BaseHTTPRequestHandler):
                 row = conn.execute("SELECT * FROM project_requests WHERE id=?", (request_id,)).fetchone()
                 response_request = serialize_request(conn, row)
                 conn.commit()
-            except sqlite3.Error:
+            except DATABASE_ERRORS:
                 conn.rollback()
                 self.fail("The request could not be saved. Please try again.", 500)
                 return
@@ -430,7 +490,7 @@ class LabLinkHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         path = unquote(urlsplit(self.path).path)
         match = re.fullmatch(r"/api/requests/([A-Za-z0-9-]+)", path)
-        if not match:
+        if not match and path != "/api/requests":
             self.fail("API route not found.", 404)
             return
         if self.demo_role() != "faculty":
@@ -439,17 +499,20 @@ class LabLinkHandler(BaseHTTPRequestHandler):
         try:
             data = self.read_json_body()
             status = str(data.get("status", "")).strip()
+            request_id = match.group(1) if match else str(data.get("id", "")).strip()
+            if not re.fullmatch(r"[A-Za-z0-9-]+", request_id):
+                raise ValueError("Choose a valid request to review.")
             if status not in VALID_STATUSES:
                 raise ValueError("Choose an available review decision.")
         except ValueError as exc:
             self.fail(str(exc), 400)
             return
 
-        request_id = match.group(1)
         with closing(connect_db()) as conn:
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute("SELECT * FROM project_requests WHERE id=?", (request_id,)).fetchone()
+                conn.begin_write()
+                request_query = "SELECT * FROM project_requests WHERE id=?" + (" FOR UPDATE" if conn.postgres else "")
+                row = conn.execute(request_query, (request_id,)).fetchone()
                 if not row:
                     conn.rollback()
                     self.fail("Request not found.", 404)
@@ -473,7 +536,7 @@ class LabLinkHandler(BaseHTTPRequestHandler):
                 updated = conn.execute("SELECT * FROM project_requests WHERE id=?", (request_id,)).fetchone()
                 result = serialize_request(conn, updated)
                 conn.commit()
-            except sqlite3.Error:
+            except DATABASE_ERRORS:
                 conn.rollback()
                 self.fail("The review decision could not be saved. Please try again.", 500)
                 return

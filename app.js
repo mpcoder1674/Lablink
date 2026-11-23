@@ -536,7 +536,7 @@ async function decideRequest(id, status) {
   if (!request || request.status !== "pending") return;
   let result;
   try {
-    result = await api(`/requests/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ status }) });
+    result = await api("/requests", { method: "PATCH", body: JSON.stringify({ id, status }) });
   } catch (error) {
     showToast("Review decision could not be saved", error.message);
     await refreshBackendData().catch(() => {});
