@@ -33,7 +33,14 @@ except ImportError:  # PostgreSQL support is installed only for Vercel deploymen
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "lablink.sqlite3"
 DB_PATH = Path(os.environ.get("LABLINK_DB_PATH", str(DEFAULT_DB))).expanduser()
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+# Vercel Marketplace storage variables are prefixed with STORAGE_. Prefer the
+# Neon-provided pooled URL before any project-level alias that may be a literal.
+DATABASE_URL = (
+    os.environ.get("STORAGE_POSTGRES_URL")
+    or os.environ.get("STORAGE_DATABASE_URL")
+    or os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL")
+)
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_BODY_BYTES = 64 * 1024
