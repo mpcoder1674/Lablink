@@ -1,5 +1,3 @@
-const STORAGE_KEY = "lablink-campus-demo-v1";
-
 const resources = [
   {
     id: "jetson",
@@ -128,29 +126,6 @@ const resources = [
   },
 ];
 
-const seedRequests = [
-  {
-    id: "req-201", student: "Sam Rivera", initials: "SR", project: "Thermal response in recycled composites",
-    resourceId: "thermal", resource: "FLIR thermal camera", lab: "Smart Structures Lab", deadline: "Nov 25, 2026",
-    dueSoon: true, slot: "Today · 11:00 – 12:30", status: "approved", purpose: "Capture temperature changes during a material stress test.",
-  },
-  {
-    id: "req-202", student: "Sam Rivera", initials: "SR", project: "Campus mobility prototype",
-    resourceId: "jetson", resource: "Jetson Orin Nano dev kit", lab: "Applied AI Lab", deadline: "Nov 29, 2026",
-    dueSoon: false, slot: "Today · 12:30 – 14:00", status: "pending", purpose: "Testing a sensor fusion pipeline for our term project.",
-  },
-  {
-    id: "req-203", student: "Noor Ahmed", initials: "NA", project: "Low-cost river quality sampler",
-    resourceId: "scope", resource: "Digital oscilloscope", lab: "Embedded Systems Lab", deadline: "Nov 26, 2026",
-    dueSoon: true, slot: "Tomorrow · 9:30 – 11:00", status: "pending", purpose: "Validate the analog sensor board before our field trial.",
-  },
-  {
-    id: "req-204", student: "Leo Chen", initials: "LC", project: "Wearable gait analysis",
-    resourceId: "thermal", resource: "FLIR thermal camera", lab: "Smart Structures Lab", deadline: "Dec 02, 2026",
-    dueSoon: false, slot: "Tomorrow · 13:00 – 14:30", status: "pending", purpose: "Compare heat distribution during walking trials.",
-  },
-];
-
 const categoryFilters = ["All resources", "AI & computing", "Fabrication", "Electronics", "Field & sensing", "Materials", "Workstations"];
 const pageMeta = {
   discover: { breadcrumb: "Resource directory", eyebrow: "NORTHBRIDGE UNIVERSITY · CAMPUS NETWORK", title: "More room to make.", description: "Find the right equipment, people, and time slot across campus. Good ideas travel further when the lab is open." },
@@ -159,21 +134,8 @@ const pageMeta = {
   approvals: { breadcrumb: "Faculty approvals", eyebrow: "FACULTY DESK · SHARED RESOURCE ACCESS", title: "Help the next idea take shape.", description: "Review project context, deadline fit, and available time before approving a cross-department session." },
 };
 
-function readSavedState() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-    if (saved && Array.isArray(saved.requests)) {
-      const savedById = new Map(saved.requests.map((request) => [request.id, request]));
-      const restoredSeeds = seedRequests.map((request) => ({ ...request, ...(savedById.get(request.id) || {}) }));
-      const newRequests = saved.requests.filter((request) => !seedRequests.some((seed) => seed.id === request.id));
-      return { requests: [...restoredSeeds, ...newRequests] };
-    }
-  } catch { /* Storage can be unavailable in a private browsing session. */ }
-  return { requests: seedRequests.map((request) => ({ ...request })) };
-}
-
 const appState = {
-  ...readSavedState(),
+  requests: [],
   currentView: "discover",
   role: "student",
   category: "All resources",
@@ -194,14 +156,29 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 }
 
-function saveState() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ requests: appState.requests })); } catch { /* The demo remains usable without persistence. */ }
-}
-
 function resourceById(id) { return resources.find((item) => item.id === id); }
 function requestById(id) { return appState.requests.find((item) => item.id === id); }
 function currentStudentRequests() { return appState.requests.filter((item) => item.student === "Sam Rivera"); }
 function pendingApprovals() { return appState.requests.filter((item) => item.status === "pending"); }
+
+async function api(path, options = {}) {
+  const headers = { "X-Demo-Role": appState.role, ...(options.headers || {}) };
+  if (options.body) headers["Content-Type"] = "application/json";
+  const response = await fetch(`/api${path}`, { ...options, headers });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `LabLink API returned ${response.status}.`);
+  return data;
+}
+
+async function refreshBackendData() {
+  const data = await api("/bootstrap");
+  for (const item of data.resources || []) {
+    const resource = resourceById(item.id);
+    if (resource) Object.assign(resource, item);
+  }
+  appState.requests = data.requests || [];
+  renderApp();
+}
 
 function iconSvg(name) {
   const icons = {
@@ -409,19 +386,11 @@ function showGuidance() {
   showToast("Fair slot matching", "The demo match considers open availability, project deadlines, and recent team usage. Lab approval and training checks still apply.");
 }
 
-function getRecommendedSlot(resource, preferredIndex = null) {
-  const openSlots = resource.slots.map((slot, index) => ({ ...slot, index })).filter((slot) => slot.open);
-  if (!openSlots.length) return null;
-  const currentDeadline = new Date(requestForm.elements.deadline.value || Date.now() + 7 * 86400000);
-  const daysUntilDeadline = Math.max(0, (currentDeadline - new Date()) / 86400000);
-  return openSlots.sort((a, b) => {
-    const aToday = a.day === "Today" ? 1 : 0;
-    const bToday = b.day === "Today" ? 1 : 0;
-    const urgencyWeight = daysUntilDeadline <= 3 ? 0.52 : 0.22;
-    const scoreA = resource.fairness - a.demand + aToday * urgencyWeight * 100;
-    const scoreB = resource.fairness - b.demand + bToday * urgencyWeight * 100;
-    return scoreB - scoreA || a.index - b.index;
-  })[0];
+async function getRecommendedSlot(resource) {
+  const deadline = requestForm.elements.deadline.value || new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+  const query = new URLSearchParams({ resource_id: resource.id, deadline });
+  const data = await api(`/recommendations?${query}`);
+  return data.recommendation;
 }
 
 function renderSlotOptions() {
@@ -434,20 +403,25 @@ function renderSlotOptions() {
   }).join("");
 }
 
-function showConflict(index) {
+async function showConflict(index) {
   const resource = appState.activeResource;
   const slot = resource?.slots[index];
   if (!slot || slot.open) return;
   appState.conflictIndex = index;
-  const recommendation = getRecommendedSlot(resource, index);
   const panel = document.getElementById("conflict-panel");
-  if (!recommendation) {
-    panel.innerHTML = `<span class="conflict-emblem">!</span><div class="conflict-copy"><strong>No open time fits yet</strong><span>Try a different resource or change the project deadline.</span></div>`;
-    panel.hidden = false;
-    return;
-  }
-  panel.innerHTML = `<span class="conflict-emblem">✳</span><div class="conflict-copy"><strong>${escapeHtml(slot.day)} at ${escapeHtml(slot.label)} is held for ${escapeHtml(slot.heldBy)}.</strong><span>Fair match: ${escapeHtml(recommendation.day)} at ${escapeHtml(recommendation.label)}. This open slot has lower recent demand and fits your project deadline.</span></div><button class="conflict-apply" type="button" data-action="apply-recommendation" data-slot-index="${recommendation.index}">Use this slot</button>`;
+  panel.innerHTML = `<span class="conflict-emblem">…</span><div class="conflict-copy"><strong>Checking available times</strong><span>LabLink is comparing open slots with your project deadline.</span></div>`;
   panel.hidden = false;
+  try {
+    const recommendation = await getRecommendedSlot(resource);
+    if (!recommendation?.bestSlot) {
+      panel.innerHTML = `<span class="conflict-emblem">!</span><div class="conflict-copy"><strong>No open time fits yet</strong><span>Try a different resource or change the project deadline.</span></div>`;
+      return;
+    }
+    const best = recommendation.bestSlot;
+    panel.innerHTML = `<span class="conflict-emblem">✳</span><div class="conflict-copy"><strong>${escapeHtml(slot.day)} at ${escapeHtml(slot.label)} is held for ${escapeHtml(slot.heldBy || "another request")}.</strong><span>Fair match: ${escapeHtml(best.day)} at ${escapeHtml(best.label)}. ${escapeHtml(recommendation.reason)}</span></div><button class="conflict-apply" type="button" data-action="apply-recommendation" data-slot-index="${best.index}">Use this slot</button>`;
+  } catch (error) {
+    panel.innerHTML = `<span class="conflict-emblem">!</span><div class="conflict-copy"><strong>Could not check alternatives</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
 }
 
 function chooseSlot(index) {
@@ -460,22 +434,29 @@ function chooseSlot(index) {
   renderSlotOptions();
 }
 
-function selectSmartSlot() {
+async function selectSmartSlot() {
   const resource = appState.activeResource || resources.find((item) => item.id === "jetson");
   if (!resource) return;
   if (!appState.activeResource) openRequest(resource.id);
-  const recommendation = getRecommendedSlot(resource);
-  if (!recommendation) {
-    showToast("No open slot found", "Try another resource or extend your project timeline.");
-    return;
-  }
-  appState.selectedSlot = recommendation.index;
-  appState.conflictIndex = null;
-  renderSlotOptions();
   const panel = document.getElementById("conflict-panel");
-  panel.innerHTML = `<span class="conflict-emblem">✳</span><div class="conflict-copy"><strong>Best fit · ${escapeHtml(recommendation.day)} at ${escapeHtml(recommendation.label)}</strong><span>Ranked by deadline fit, lower recent demand, and the earliest available time.</span></div><button class="conflict-apply" type="button" data-action="dismiss-match">Got it</button>`;
   panel.hidden = false;
-  panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  panel.innerHTML = `<span class="conflict-emblem">…</span><div class="conflict-copy"><strong>Finding a fair time</strong><span>Checking availability and your project deadline.</span></div>`;
+  try {
+    const recommendation = await getRecommendedSlot(resource);
+    const best = recommendation?.bestSlot;
+    if (!best) {
+      showToast("No open slot found", "Try another resource or extend your project timeline.");
+      return;
+    }
+    appState.selectedSlot = best.index;
+    appState.conflictIndex = null;
+    renderSlotOptions();
+    panel.innerHTML = `<span class="conflict-emblem">✳</span><div class="conflict-copy"><strong>Best fit · ${escapeHtml(best.day)} at ${escapeHtml(best.label)}</strong><span>${escapeHtml(recommendation.reason)}</span></div><button class="conflict-apply" type="button" data-action="dismiss-match">Got it</button>`;
+    panel.hidden = false;
+    panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  } catch (error) {
+    panel.innerHTML = `<span class="conflict-emblem">!</span><div class="conflict-copy"><strong>Could not find a time</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
 }
 
 function openRequest(resourceId) {
@@ -510,7 +491,7 @@ function closeModal() {
   if (appState.previouslyFocused && typeof appState.previouslyFocused.focus === "function") appState.previouslyFocused.focus();
 }
 
-function submitRequest(event) {
+async function submitRequest(event) {
   event.preventDefault();
   if (!appState.activeResource) return;
   if (appState.selectedSlot === null || !appState.activeResource.slots[appState.selectedSlot]?.open) {
@@ -523,40 +504,50 @@ function submitRequest(event) {
     return;
   }
   const resource = appState.activeResource;
-  const slot = resource.slots[appState.selectedSlot];
-  const date = new Date(requestForm.elements.deadline.value);
-  const deadline = date.toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" });
-  const newRequest = {
-    id: `req-${Date.now()}`,
-    student: "Sam Rivera",
-    initials: "SR",
-    project: requestForm.elements.project.value.trim(),
-    resourceId: resource.id,
-    resource: resource.name,
-    lab: resource.lab,
-    deadline,
-    dueSoon: (date.getTime() - Date.now()) / 86400000 <= 3,
-    slot: `${slot.day} · ${slot.label}`,
-    status: resource.access === "Open access" ? "approved" : "pending",
-    purpose: requestForm.elements.purpose.value.trim(),
-  };
-  appState.requests.unshift(newRequest);
-  saveState();
+  let created;
+  try {
+    created = await api("/requests", {
+      method: "POST",
+      body: JSON.stringify({
+        project: requestForm.elements.project.value.trim(),
+        purpose: requestForm.elements.purpose.value.trim(),
+        resource_id: resource.id,
+        deadline: requestForm.elements.deadline.value,
+        duration: Number(requestForm.elements.duration.value),
+        training: requestForm.elements.training.checked,
+        slot_index: appState.selectedSlot,
+      }),
+    });
+  } catch (error) {
+    showToast("Request could not be saved", error.message);
+    if (/slot is no longer available/i.test(error.message)) await refreshBackendData().catch(() => {});
+    return;
+  }
+  appState.requests.unshift(created.request);
   closeModal();
   setView(resource.access === "Open access" ? "bookings" : "requests");
-  if (resource.access === "Open access") showToast("Lab session reserved", "Your project slot is confirmed in this browser demo.");
-  else showToast("Request sent to the lab team", "Your project context and best-fit time are ready for faculty review.");
+  await refreshBackendData().catch((error) => showToast("Request saved; list did not refresh", error.message));
+  if (resource.access === "Open access") showToast("Lab session reserved", "Your project slot is saved in the LabLink demo database.");
+  else showToast("Request sent to the lab team", "Your project request is saved for faculty review.");
 }
 
-function decideRequest(id, status) {
+async function decideRequest(id, status) {
   const request = requestById(id);
   if (!request || request.status !== "pending") return;
-  request.status = status;
-  saveState();
+  let result;
+  try {
+    result = await api(`/requests/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ status }) });
+  } catch (error) {
+    showToast("Review decision could not be saved", error.message);
+    await refreshBackendData().catch(() => {});
+    return;
+  }
+  request.status = result.request.status;
   renderApp();
-  if (status === "approved") showToast("Request approved", `${request.student} can now see this session as confirmed in the demo.`);
-  else if (status === "declined") showToast("Request declined", "The student’s request status has been updated in the demo.");
-  else showToast("More details requested", "The student’s request is marked for follow-up in the demo.");
+  await refreshBackendData().catch((error) => showToast("Decision saved; list did not refresh", error.message));
+  if (status === "approved") showToast("Request approved", `${request.student} can now see this session as confirmed in the demo database.`);
+  else if (status === "declined") showToast("Request declined", "The student’s request status has been updated.");
+  else showToast("More details requested", "The student’s request is marked for follow-up.");
 }
 
 function showRequestForAnyResource() {
@@ -608,9 +599,10 @@ document.addEventListener("change", (event) => {
     appState.role = event.target.value;
     const chosenView = appState.role === "faculty" ? "approvals" : appState.currentView === "approvals" ? "discover" : appState.currentView;
     setView(chosenView);
+    refreshBackendData().catch((error) => showToast("Could not load LabLink data", error.message));
     showToast(appState.role === "faculty" ? "Faculty preview enabled" : "Student preview enabled", "Switch roles to explore the student request flow and faculty approval desk.");
   }
-  if (event.target.name === "deadline" && appState.conflictIndex !== null) showConflict(appState.conflictIndex);
+  if (event.target.name === "deadline" && appState.conflictIndex !== null) void showConflict(appState.conflictIndex);
 });
 
 requestForm.addEventListener("submit", submitRequest);
@@ -628,7 +620,8 @@ document.addEventListener("keydown", (event) => {
 
 document.querySelector(".notification-button").addEventListener("click", () => showToast("You’re all caught up", "New booking decisions and lab updates will appear here."));
 document.querySelector(".campus-switch").addEventListener("click", () => showToast("Northbridge University", "The campus switcher is a preview. More campuses can be connected when the platform is deployed."));
-document.querySelector(".profile-card").addEventListener("click", () => showToast("Demo profile", "Student and faculty accounts are represented with sample data in this local prototype."));
+document.querySelector(".profile-card").addEventListener("click", () => showToast("Demo identity", "There is no sign-in. This preview identity and role switch are for evaluation only; do not use real student data."));
 
 renderApp();
+refreshBackendData().catch((error) => showToast("LabLink backend is not running", `${error.message} Start it from the project folder with: python server.py`));
 

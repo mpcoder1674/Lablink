@@ -1,27 +1,41 @@
 # LabLink
 
-LabLink is a local, browser-based prototype for discovering shared campus lab equipment, requesting project access, and reviewing faculty approvals.
+LabLink is a campus laboratory resource-sharing demo. Students can discover equipment, request project-based access, and receive explainable slot suggestions. Faculty can review pending requests. The Python backend stores requests in SQLite.
 
 ## Run locally
 
-From this folder, start a static server:
+Install Python 3.10 or newer, then open a terminal in this project folder and run:
 
 ```powershell
-python -m http.server 5173
+python server.py
 ```
 
-Then open `http://localhost:5173` in a browser. No install step or API key is required.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Stop the server with `Ctrl+C`. No package installation, API key, or sign-in is required.
 
-## Explore the prototype
+The database is created at `data/lablink.sqlite3` the first time the server starts. To use a different file, set `LABLINK_DB_PATH`. `HOST` and `PORT` can also be set through environment variables; the defaults are `127.0.0.1` and `8000`.
+
+## Features
 
 - Search and filter a sample resource directory with equipment from several departments.
-- Open a resource card to create a project-based access request with a purpose, deadline, training check, and preferred slot.
-- Choose a held slot to see a feasible alternative, or use **Find my best slot** to see how the matching preview ranks availability, deadline fit, and recent demand.
-- Switch **View as** to Faculty to approve, decline, or request more details for pending sample requests.
-- Student requests and faculty decisions persist in this browser through `localStorage`.
+- Create project requests with purpose, deadline, session length, safety onboarding confirmation, and a preferred slot.
+- Persist requests and faculty decisions in SQLite, with conflict checks performed inside a write transaction.
+- Get a backend slot recommendation ranked by deadline urgency, resource fairness score, and recent demand. The API returns the reason for the recommendation.
+- Switch between student and faculty preview modes to explore the student request flow and faculty approval desk.
 
-All people, labs, requests, and availability in the prototype are illustrative sample data. The matching preview is a transparent, deterministic demo heuristic; no external GenAI service, authentication, booking backend, or campus calendar is connected. Faculty approvals and reservations are simulated in this browser.
+## API
 
-## Current scope
+- `GET /api/health` — backend status and demo mode.
+- `GET /api/bootstrap` — resources and requests for the selected demo role.
+- `GET /api/resources` — resource catalogue and current availability.
+- `GET /api/requests` — requests visible to the selected demo role.
+- `GET /api/recommendations?resource_id=jetson&deadline=2026-12-01` — best available slot and alternatives.
+- `POST /api/requests` — create a student demo request.
+- `PATCH /api/requests/{id}` — record a faculty demo decision (`approved`, `declined`, or `needs-info`).
 
-The source is now published in a public GitHub repository. Live hosting, Cloud Run deployment, and challenge submission links remain for a later step. The attached participant briefing evaluates code quality, security, efficiency, accessibility, testing, and problem alignment; its submission and deployment steps apply when you are ready to submit.
+The frontend uses the `X-Demo-Role` header to select `student` or `faculty`. This is a UI preview mechanism only. There is deliberately no login gate so evaluators can try both flows without credentials; the role header is not real authentication or a production security boundary. All people, labs, and starter requests are illustrative. Do not store real student data or expose this demo server to a public network.
+
+The matcher is deterministic and explainable. It does not call an external GenAI service; a provider integration would need to be added separately if the project later requires generative recommendations.
+
+## GitHub Pages
+
+GitHub Pages only hosts static files and cannot run this Python API. Run the complete app with `python server.py`, or deploy the backend to a Python-capable host and configure the frontend to use that API before publishing the static site.
